@@ -298,6 +298,7 @@ def fetch_all_stocks_data(symbols, batch_size: int = 50, workers: int = 5):
 # 6) DASH APP SETUP
 # -------------------------------------------------------------------
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
+server = app.server
 
 app.layout = dbc.Container([
     
