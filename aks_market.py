@@ -8,6 +8,7 @@ from datetime import datetime
 from nsepython import nse_eq
 import threading
 import time
+import random
 
 
 # -------------------------------------------------------------------
@@ -34,22 +35,28 @@ def safe_float(v):
         return None
 
 
-def retry_with_backoff(func, symbol: str, max_retries: int = 3, base_delay: float = 1.0):
+def retry_with_backoff(func, symbol: str, max_retries: int = 3, base_delay: float = 2.0):
     """Retry a function with exponential backoff for rate limit errors."""
     for attempt in range(max_retries):
         try:
+            # Add random jitter to avoid thundering herd
+            if attempt > 0:
+                jitter = random.uniform(0, 0.5)
+                delay = (base_delay * (2 ** attempt)) + jitter
+                time.sleep(delay)
             return func(symbol)
         except Exception as e:
-            if "rate" in str(e).lower() or "429" in str(e):
+            error_msg = str(e).lower()
+            if "rate" in error_msg or "429" in error_msg or "expecting value" in error_msg or "delisted" in error_msg:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
-                    print(f"  Rate limited on {symbol}, retrying in {delay:.1f}s...")
-                    time.sleep(delay)
+                    print(f"  Rate limited on {symbol}, retry {attempt + 1}/{max_retries} in {delay:.1f}s...")
                 else:
-                    print(f"  Max retries exceeded for {symbol}: {e}")
+                    print(f"  Max retries for {symbol}, skipping...")
                     return None
             else:
-                raise
+                print(f"  Error for {symbol}: {e}")
+                return None
     return None
 
 
@@ -76,7 +83,7 @@ SYMBOLS = load_symbol_list()
 # -------------------------------------------------------------------
 # 2) CONSOLIDATED NSE DATA FETCH
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=128)
 def get_nse_data(symbol: str):
     """Fetch full NSE data once and cache."""
     try:
@@ -89,7 +96,7 @@ def get_nse_data(symbol: str):
 # -------------------------------------------------------------------
 # 3) FUNDAMENTALS for single stock
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=128)
 def get_fundamentals(symbol: str):
     try:
         data = get_nse_data(symbol)
@@ -136,56 +143,59 @@ def get_fundamentals(symbol: str):
         }
 
     except Exception as e:
-        print("Fundamental Fetch Error:", e)
+        print(f"Fundamental Fetch Error for {symbol}: {e}")
         return None
 
 
 # -------------------------------------------------------------------
 # 4) VOLUME STATS (with retry backoff for rate limits)
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=128)
 def get_volume_stats(symbol: str):
     """Return volume metrics with retry backoff for rate limits."""
     
     def _fetch_volume(sym):
-        tk = yf.Ticker(sym + ".NS")
-        
-        avg_vol = None
         try:
-            hist_30 = tk.history(period="30d", interval="1d")
-            if "Volume" in hist_30.columns and not hist_30["Volume"].empty:
-                avg_vol = float(hist_30["Volume"].mean())
-        except Exception as e:
-            print(f"  Avg volume fetch error for {sym}: {e}")
-
-        todays_vol = None
-        try:
-            intraday = tk.history(period="1d", interval="1m")
-            if "Volume" in intraday.columns and not intraday["Volume"].empty:
-                todays_vol = float(intraday["Volume"].sum())
-        except Exception:
+            # Add delay before each yfinance call
+            time.sleep(random.uniform(0.5, 1.0))
+            
+            tk = yf.Ticker(sym + ".NS")
+            
+            avg_vol = None
             try:
+                hist_30 = tk.history(period="30d", interval="1d")
+                if "Volume" in hist_30.columns and not hist_30["Volume"].empty:
+                    avg_vol = float(hist_30["Volume"].mean())
+            except Exception as e:
+                print(f"  Avg volume fetch error for {sym}: {e}")
+
+            todays_vol = None
+            try:
+                # Use daily data instead of intraday to reduce API calls
                 daily = tk.history(period="1d", interval="1d")
                 if "Volume" in daily.columns and not daily["Volume"].empty:
                     todays_vol = float(daily["Volume"].iloc[-1])
+            except Exception as e:
+                print(f"  Today volume fetch error for {sym}: {e}")
+
+            vol_change_pct = None
+            try:
+                if avg_vol and todays_vol is not None and avg_vol != 0:
+                    vol_change_pct = (todays_vol - avg_vol) / avg_vol * 100.0
             except Exception:
-                todays_vol = None
+                pass
 
-        vol_change_pct = None
-        try:
-            if avg_vol and todays_vol is not None and avg_vol != 0:
-                vol_change_pct = (todays_vol - avg_vol) / avg_vol * 100.0
-        except Exception:
-            pass
-
-        return {
-            "avg_volume": avg_vol,
-            "todays_volume": todays_vol,
-            "volume_change_pct": vol_change_pct,
-        }
+            return {
+                "avg_volume": avg_vol,
+                "todays_volume": todays_vol,
+                "volume_change_pct": vol_change_pct,
+            }
+        except Exception as e:
+            print(f"  Volume fetch error for {sym}: {e}")
+            return None
     
     # Retry with backoff on rate limits
-    return retry_with_backoff(_fetch_volume, symbol, max_retries=3, base_delay=0.5) or {
+    return retry_with_backoff(_fetch_volume, symbol, max_retries=3, base_delay=2.0) or {
         "avg_volume": None,
         "todays_volume": None,
         "volume_change_pct": None,
@@ -200,12 +210,12 @@ def get_volume_stats(symbol: str):
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-def fetch_all_stocks_data(symbols, batch_size: int = 50, workers: int = 5):
+def fetch_all_stocks_data(symbols, batch_size: int = 15, workers: int = 2):
     """Fetch data for multiple stocks in parallel using ThreadPoolExecutor.
 
     - symbols: iterable of symbol strings
-    - batch_size: number of symbols to process per batch (limits concurrent pressure)
-    - workers: max threads per batch (reduced to minimize rate limiting)
+    - batch_size: number of symbols to process per batch (reduced for free tier)
+    - workers: max threads per batch (reduced to 2 for rate limiting)
 
     Returns a list of stock_data dicts (same shape as before).
     """
@@ -214,9 +224,13 @@ def fetch_all_stocks_data(symbols, batch_size: int = 50, workers: int = 5):
     def _fetch_one(symbol):
         try:
             fund = get_fundamentals(symbol)
-            vol = get_volume_stats(symbol)
             if not fund:
                 return None
+            
+            # Add delay between API calls
+            time.sleep(random.uniform(0.3, 0.7))
+            
+            vol = get_volume_stats(symbol)
 
             price_info = safe_dict(fund.get('priceInfo', {}))
             # Normalize numeric fields
@@ -248,9 +262,9 @@ def fetch_all_stocks_data(symbols, batch_size: int = 50, workers: int = 5):
                 "TODAY_CURRENT_PRICE": last_price,
                 "TODAY_CURRENT_PRICE_CHANGE": price_change,
                 "TODAY_CURRENT_PRICE_CHANGE_PCT": price_change_pct,
-                "TODAY_VOLUME_AVERAGE": vol.get('avg_volume'),
-                "TODAY_VOLUME": vol.get('todays_volume'),
-                "VOL_CHANGE_PCT": vol.get('volume_change_pct'),
+                "TODAY_VOLUME_AVERAGE": vol.get('avg_volume') if vol else None,
+                "TODAY_VOLUME": vol.get('todays_volume') if vol else None,
+                "VOL_CHANGE_PCT": vol.get('volume_change_pct') if vol else None,
                 "10": "",
                 "100": "",
                 "5_DAY_PCT": "",
@@ -280,16 +294,16 @@ def fetch_all_stocks_data(symbols, batch_size: int = 50, workers: int = 5):
                 try:
                     res = fut.result()
                 except Exception as e:
-                    # _fetch_one already handles errors, but catch any executor errors here
                     s = futures.get(fut)
                     print(f"Executor error for {s}: {e}")
                 if res:
                     all_data.append(res)
         
-        # Add delay between batches to reduce API pressure
+        # Add longer delay between batches to reduce API pressure
         if i + batch_size < len(symbols):
-            print(f"  Batch {batch_num} complete. Waiting 2s before next batch...")
-            time.sleep(2)
+            delay = random.uniform(3, 5)
+            print(f"  Batch {batch_num} complete. Waiting {delay:.1f}s before next batch...")
+            time.sleep(delay)
 
     return all_data
 
@@ -328,11 +342,12 @@ app.layout = dbc.Container([
         ], width=10),
     ], className="mb-3"),
     
-    dcc.Interval(id="refresh-all", interval=180_000, n_intervals=0),
+    dcc.Interval(id="refresh-all", interval=300_000, n_intervals=0),  # Increased to 5 min
     dcc.Store(id="refresh-trigger-all", data=0),
     
     dbc.Row([
         dbc.Col([
+            html.Div(id="loading-status", style={"textAlign": "center", "color": "#00D4FF", "fontSize": "1rem", "marginBottom": "10px"}),
             html.Div(id="stocks-table-container", style={"overflowX": "auto"})
         ], width=12),
     ])
@@ -376,17 +391,22 @@ def update_timestamp_all(intervals, manual_refresh):
 # 9) CALLBACK → Generate Table
 # -------------------------------------------------------------------
 @app.callback(
-    Output("stocks-table-container", "children"),
+    [Output("stocks-table-container", "children"),
+     Output("loading-status", "children")],
     Input("refresh-all", "n_intervals"),
     Input("refresh-trigger-all", "data")
 )
 def generate_table(intervals, manual_refresh):
     """Generate table with all stocks data (HTML table like the old UI)."""
 
+    loading_msg = html.Div([
+        html.Span("⏳ Loading data... This may take 3-5 minutes on free tier", style={"color": "#ffa500", "fontWeight": "600"})
+    ])
+
     stocks_data = fetch_all_stocks_data(SYMBOLS)
 
     if not stocks_data:
-        return html.P("No data available", style={"color": "#ff0000"})
+        return html.P("No data available", style={"color": "#ff0000"}), ""
 
     def format_value(val, decimals=2):
         """Format numeric values."""
@@ -404,7 +424,7 @@ def generate_table(intervals, manual_refresh):
             return "-"
         try:
             v = float(val)
-            color = "#00cc66" if v >= 0 else "#ff4d4d"  # Green if positive, red if negative
+            color = "#00cc66" if v >= 0 else "#ff4d4d"
             symbol = "▲" if v >= 0 else "▼"
             return html.Span(f"{symbol} {v:.2f}%", style={"color": color, "fontWeight": "700"})
         except:
@@ -485,14 +505,20 @@ def generate_table(intervals, manual_refresh):
         style={"fontSize": "0.9rem", "marginTop": "20px"}
     )
     
-    return table
+    success_msg = html.Div([
+        html.Span(f"✅ Loaded {len(stocks_data)} stocks successfully", style={"color": "#00cc66", "fontWeight": "600"})
+    ])
+    
+    return table, success_msg
 
 
 # -------------------------------------------------------------------
 # 10) RUN APP
 # -------------------------------------------------------------------
 if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", 8051))
     run_func = getattr(app, "run", None) or getattr(app, "run_server", None)
     if run_func is None:
         raise RuntimeError("No compatible Dash run API found on the 'app' object")
-    run_func(debug=False, port=8051)  # Run on port 8051 to avoid conflict with main app
+    run_func(debug=False, host="0.0.0.0", port=port)
