@@ -1,15 +1,13 @@
 import dash
-from dash import html, dcc, dash_table, Input, Output
+from dash import html, dcc, Input, Output, State
 import dash_bootstrap_components as dbc
 import pandas as pd
 import yfinance as yf
 from functools import lru_cache
 from datetime import datetime
 from nsepython import nse_eq
-import threading
 import time
-import random
-
+from dash.dependencies import ALL
 
 # -------------------------------------------------------------------
 # SAFETY WRAPPER
@@ -28,62 +26,69 @@ def safe_float(v):
         s = str(v).strip()
         if s == "" or s.upper() == "NA":
             return None
-        # Remove commas commonly found in large numbers
         s = s.replace(",", "")
         return float(s)
     except Exception:
         return None
 
 
-def retry_with_backoff(func, symbol: str, max_retries: int = 3, base_delay: float = 2.0):
+def retry_with_backoff(func, symbol: str, max_retries: int = 3, base_delay: float = 1.0):
     """Retry a function with exponential backoff for rate limit errors."""
     for attempt in range(max_retries):
         try:
-            # Add random jitter to avoid thundering herd
-            if attempt > 0:
-                jitter = random.uniform(0, 0.5)
-                delay = (base_delay * (2 ** attempt)) + jitter
-                time.sleep(delay)
             return func(symbol)
         except Exception as e:
-            error_msg = str(e).lower()
-            if "rate" in error_msg or "429" in error_msg or "expecting value" in error_msg or "delisted" in error_msg:
+            if "rate" in str(e).lower() or "429" in str(e):
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
-                    print(f"  Rate limited on {symbol}, retry {attempt + 1}/{max_retries} in {delay:.1f}s...")
+                    print(f"  Rate limited on {symbol}, retrying in {delay:.1f}s...")
+                    time.sleep(delay)
                 else:
-                    print(f"  Max retries for {symbol}, skipping...")
+                    print(f"  Max retries exceeded for {symbol}: {e}")
                     return None
             else:
-                print(f"  Error for {symbol}: {e}")
-                return None
+                raise
     return None
 
 
-
 # -------------------------------------------------------------------
-# 1) Load all NSE symbols
+# 1) Load pre-generated symbol-industry mapping (FAST!)
 # -------------------------------------------------------------------
 @lru_cache(maxsize=1)
-def load_symbol_list():
+def load_symbols_with_industries():
+    """Load symbols and industries from pre-generated CSV - INSTANT LOAD!"""
     try:
-        # Load symbols from local ticker.csv file
-        df = pd.read_csv("nifty100.csv")
-        df = df[["ticker"]]
-        # Extract symbol without 'NSE:' prefix for API calls
-        symbols = [t.replace("NSE:", "") for t in df["ticker"].unique()]
-        return sorted(symbols)
+        # Load from the pre-generated CSV with industries
+        df = pd.read_csv("nifty100_with_industries.csv")
+        
+        print(f"✓ Loaded {len(df)} symbols with industries from CSV")
+        
+        # Create symbol -> industry mapping
+        symbol_industry_map = dict(zip(df["symbol"], df["industry"]))
+        
+        # Remove N/A entries if you want
+        # symbol_industry_map = {k: v for k, v in symbol_industry_map.items() if v != "N/A"}
+        
+        print(f"✓ Industry mapping ready with {len(symbol_industry_map)} stocks!")
+        
+        return symbol_industry_map
+        
+    except FileNotFoundError:
+        print("ERROR: nifty100_with_industries.csv not found!")
+        print("Please run fetch_static_data.py first to generate the file.")
+        return {}
     except Exception as e:
-        print(f"Error loading ticker.csv: {e}")
-        return ["RELIANCE", "TCS", "HDFCBANK", "INFY", "WIPRO"]  # fallback
+        print(f"Error loading CSV: {e}")
+        return {}
 
-SYMBOLS = load_symbol_list()
+
+SYMBOL_INDUSTRY_MAP = {}
 
 
 # -------------------------------------------------------------------
 # 2) CONSOLIDATED NSE DATA FETCH
 # -------------------------------------------------------------------
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=256)
 def get_nse_data(symbol: str):
     """Fetch full NSE data once and cache."""
     try:
@@ -96,7 +101,7 @@ def get_nse_data(symbol: str):
 # -------------------------------------------------------------------
 # 3) FUNDAMENTALS for single stock
 # -------------------------------------------------------------------
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=256)
 def get_fundamentals(symbol: str):
     try:
         data = get_nse_data(symbol)
@@ -108,7 +113,6 @@ def get_fundamentals(symbol: str):
         price_info = safe_dict(data.get("priceInfo"))
         industry = safe_dict(data.get("industryInfo"))
 
-        # Use safe conversions to handle 'NA' and non-numeric values
         pe = safe_float(meta.get("pdSymbolPe") or meta.get("pdSectorPe"))
         last_price = safe_float(price_info.get("lastPrice") or price_info.get("close"))
 
@@ -143,102 +147,121 @@ def get_fundamentals(symbol: str):
         }
 
     except Exception as e:
-        print(f"Fundamental Fetch Error for {symbol}: {e}")
+        print("Fundamental Fetch Error:", e)
         return None
 
 
 # -------------------------------------------------------------------
-# 4) VOLUME STATS (with retry backoff for rate limits)
+# 4) HISTORICAL PRICE COMPARISON
 # -------------------------------------------------------------------
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=256)
+def get_historical_comparison(symbol: str, days: int):
+    """Get price comparison for N days ago."""
+    try:
+        tk = yf.Ticker(symbol + ".NS")
+        
+        # Fetch historical data - get extra days to account for weekends/holidays
+        hist = tk.history(period=f"{days + 10}d", interval="1d")
+        
+        if hist.empty or len(hist) < 2:
+            return None, None, None
+        
+        # Get current price (most recent)
+        current_price = float(hist['Close'].iloc[-1])
+        
+        # Get price from N days ago (or closest available)
+        if len(hist) >= days:
+            old_price = float(hist['Close'].iloc[-days])
+        else:
+            # Use oldest available if not enough data
+            old_price = float(hist['Close'].iloc[0])
+        
+        # Calculate change
+        price_change = current_price - old_price
+        price_change_pct = (price_change / old_price * 100) if old_price != 0 else None
+        
+        return old_price, price_change, price_change_pct
+        
+    except Exception as e:
+        print(f"Historical data error for {symbol}: {e}")
+        return None, None, None
+
+
+# -------------------------------------------------------------------
+# 5) VOLUME STATS
+# -------------------------------------------------------------------
+@lru_cache(maxsize=256)
 def get_volume_stats(symbol: str):
     """Return volume metrics with retry backoff for rate limits."""
     
     def _fetch_volume(sym):
+        tk = yf.Ticker(sym + ".NS")
+        
+        avg_vol = None
         try:
-            # Add delay before each yfinance call
-            time.sleep(random.uniform(0.5, 1.0))
-            
-            tk = yf.Ticker(sym + ".NS")
-            
-            avg_vol = None
-            try:
-                hist_30 = tk.history(period="30d", interval="1d")
-                if "Volume" in hist_30.columns and not hist_30["Volume"].empty:
-                    avg_vol = float(hist_30["Volume"].mean())
-            except Exception as e:
-                print(f"  Avg volume fetch error for {sym}: {e}")
+            hist_30 = tk.history(period="30d", interval="1d")
+            if "Volume" in hist_30.columns and not hist_30["Volume"].empty:
+                avg_vol = float(hist_30["Volume"].mean())
+        except Exception as e:
+            print(f"  Avg volume fetch error for {sym}: {e}")
 
-            todays_vol = None
+        todays_vol = None
+        try:
+            intraday = tk.history(period="1d", interval="1m")
+            if "Volume" in intraday.columns and not intraday["Volume"].empty:
+                todays_vol = float(intraday["Volume"].sum())
+        except Exception:
             try:
-                # Use daily data instead of intraday to reduce API calls
                 daily = tk.history(period="1d", interval="1d")
                 if "Volume" in daily.columns and not daily["Volume"].empty:
                     todays_vol = float(daily["Volume"].iloc[-1])
-            except Exception as e:
-                print(f"  Today volume fetch error for {sym}: {e}")
-
-            vol_change_pct = None
-            try:
-                if avg_vol and todays_vol is not None and avg_vol != 0:
-                    vol_change_pct = (todays_vol - avg_vol) / avg_vol * 100.0
             except Exception:
-                pass
+                todays_vol = None
 
-            return {
-                "avg_volume": avg_vol,
-                "todays_volume": todays_vol,
-                "volume_change_pct": vol_change_pct,
-            }
-        except Exception as e:
-            print(f"  Volume fetch error for {sym}: {e}")
-            return None
+        vol_change_pct = None
+        try:
+            if avg_vol and todays_vol is not None and avg_vol != 0:
+                vol_change_pct = (todays_vol - avg_vol) / avg_vol * 100.0
+        except Exception:
+            pass
+
+        return {
+            "avg_volume": avg_vol,
+            "todays_volume": todays_vol,
+            "volume_change_pct": vol_change_pct,
+        }
     
-    # Retry with backoff on rate limits
-    return retry_with_backoff(_fetch_volume, symbol, max_retries=3, base_delay=2.0) or {
+    return retry_with_backoff(_fetch_volume, symbol, max_retries=3, base_delay=0.5) or {
         "avg_volume": None,
         "todays_volume": None,
         "volume_change_pct": None,
     }
 
 
-
-
 # -------------------------------------------------------------------
-# 5) FETCH DATA FOR ALL SYMBOLS (for table)
+# 6) FETCH DATA FOR SYMBOLS IN SELECTED INDUSTRY
 # -------------------------------------------------------------------
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-def fetch_all_stocks_data(symbols, batch_size: int = 15, workers: int = 2):
-    """Fetch data for multiple stocks in parallel using ThreadPoolExecutor.
-
-    - symbols: iterable of symbol strings
-    - batch_size: number of symbols to process per batch (reduced for free tier)
-    - workers: max threads per batch (reduced to 2 for rate limiting)
-
-    Returns a list of stock_data dicts (same shape as before).
-    """
+def fetch_stocks_data_for_industry(symbols, days_comparison=10, batch_size: int = 50, workers: int = 5):
+    """Fetch data for multiple stocks in parallel."""
     all_data = []
 
     def _fetch_one(symbol):
         try:
             fund = get_fundamentals(symbol)
+            vol = get_volume_stats(symbol)
+            hist_price, hist_change, hist_change_pct = get_historical_comparison(symbol, days_comparison)
+            
             if not fund:
                 return None
-            
-            # Add delay between API calls
-            time.sleep(random.uniform(0.3, 0.7))
-            
-            vol = get_volume_stats(symbol)
 
             price_info = safe_dict(fund.get('priceInfo', {}))
-            # Normalize numeric fields
             last_price = fund.get('lastPrice')
             prev_close = safe_float(price_info.get('previousClose') or price_info.get('close'))
             today_open = safe_float(price_info.get('open'))
 
-            # Calculate price change
             price_change = None
             price_change_pct = None
             try:
@@ -256,21 +279,20 @@ def fetch_all_stocks_data(symbols, batch_size: int = 15, workers: int = 2):
                 "SYMBOL": symbol,
                 "STOCK_NAME": symbol,
                 "INDUSTRIES": fund.get('Sector', 'N/A'),
-                "10_DAY_CHART": "",
                 "LAST_DAY_CLOSING_PRICE": prev_close,
                 "TODAY_PRICE_OPEN": today_open,
                 "TODAY_CURRENT_PRICE": last_price,
                 "TODAY_CURRENT_PRICE_CHANGE": price_change,
                 "TODAY_CURRENT_PRICE_CHANGE_PCT": price_change_pct,
-                "TODAY_VOLUME_AVERAGE": vol.get('avg_volume') if vol else None,
-                "TODAY_VOLUME": vol.get('todays_volume') if vol else None,
-                "VOL_CHANGE_PCT": vol.get('volume_change_pct') if vol else None,
-                "10": "",
-                "100": "",
-                "5_DAY_PCT": "",
-                "30_DAY_PCT": "",
+                "HISTORICAL_PRICE": hist_price,
+                "HISTORICAL_CHANGE": hist_change,
+                "HISTORICAL_CHANGE_PCT": hist_change_pct,
+                "TODAY_VOLUME_AVERAGE": vol.get('avg_volume'),
+                "TODAY_VOLUME": vol.get('todays_volume'),
+                "VOL_CHANGE_PCT": vol.get('volume_change_pct'),
                 "MARKET_CAP_CR": fund.get('Market Cap'),
                 "PE": fund.get('P/E'),
+                "EPS": fund.get('EPS'),
                 "52WEEK_HIGH": fund.get('52W High'),
                 "52WEEK_LOW": fund.get('52W Low'),
             }
@@ -279,7 +301,6 @@ def fetch_all_stocks_data(symbols, batch_size: int = 15, workers: int = 2):
             print(f"Error fetching data for {symbol}: {e}")
             return None
 
-    # Process in batches to avoid too much pressure on APIs
     symbols = list(symbols)
     for i in range(0, len(symbols), batch_size):
         batch = symbols[i : i + batch_size]
@@ -299,11 +320,9 @@ def fetch_all_stocks_data(symbols, batch_size: int = 15, workers: int = 2):
                 if res:
                     all_data.append(res)
         
-        # Add longer delay between batches to reduce API pressure
         if i + batch_size < len(symbols):
-            delay = random.uniform(3, 5)
-            print(f"  Batch {batch_num} complete. Waiting {delay:.1f}s before next batch...")
-            time.sleep(delay)
+            print(f"  Batch {batch_num} complete. Waiting 2s before next batch...")
+            time.sleep(2)
 
     return all_data
 
@@ -311,20 +330,112 @@ def fetch_all_stocks_data(symbols, batch_size: int = 15, workers: int = 2):
 # -------------------------------------------------------------------
 # 6) DASH APP SETUP
 # -------------------------------------------------------------------
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
+app = dash.Dash(
+    __name__, 
+    external_stylesheets=[dbc.themes.DARKLY],
+    suppress_callback_exceptions=True
+)
+
 server = app.server
+# Add custom CSS for dropdown styling
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            .Select-control {
+                background-color: #2a2a2a !important;
+                border: 1px solid #444 !important;
+            }
+            .Select-menu-outer {
+                background-color: #2a2a2a !important;
+                border: 1px solid #444 !important;
+                z-index: 9999 !important;
+            }
+            .Select-option {
+                background-color: #2a2a2a !important;
+                color: #fff !important;
+                padding: 8px 10px !important;
+            }
+            .Select-option:hover {
+                background-color: #00D4FF !important;
+                color: #000 !important;
+            }
+            .Select-value-label {
+                color: #fff !important;
+            }
+            .Select-placeholder {
+                color: #aaa !important;
+            }
+            .Select-input > input {
+                color: #fff !important;
+            }
+            .is-focused .Select-control {
+                border-color: #00D4FF !important;
+            }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
 
 app.layout = dbc.Container([
     
-    html.H2("📊 AKS Market - NIFTY100 (NSE)", className="text-center my-4", style={"color": "#00D4FF"}),
+    html.H2("📊 AKS Market - NIFTY100", className="text-center my-4", style={"color": "#00D4FF"}),
     
     dbc.Row([
         dbc.Col([
+            html.Label("Select Industry:", style={"color": "#00D4FF", "fontWeight": "600", "marginBottom": "5px"}),
+            dcc.Dropdown(
+                id="industry-filter",
+                options=[],
+                value=None,
+                placeholder="Select an industry to load data...",
+                style={
+                    "backgroundColor": "#2a2a2a",
+                    "color": "#fff",
+                    "borderRadius": "5px",
+                },
+                className="custom-dropdown"
+            )
+        ], width=3),
+        dbc.Col([
+            html.Label("Days for Comparison:", style={"color": "#00D4FF", "fontWeight": "600", "marginBottom": "5px"}),
+            dcc.Input(
+                id="days-input",
+                type="number",
+                placeholder="Enter days (e.g., 10, 50, 200)",
+                value=10,
+                min=1,
+                max=365,
+                style={
+                    "backgroundColor": "#2a2a2a",
+                    "color": "#fff",
+                    "border": "1px solid #444",
+                    "borderRadius": "5px",
+                    "padding": "8px",
+                    "width": "100%"
+                }
+            )
+        ], width=2),
+        dbc.Col([
             dbc.Button(
                 "⟳ Refresh Data",
-                id="refresh-all-btn",
+                id="refresh-btn",
                 color="info",
                 size="lg",
+                disabled=True,
                 style={
                     "fontWeight": "700",
                     "borderRadius": "5px",
@@ -334,21 +445,37 @@ app.layout = dbc.Container([
                     "background": "linear-gradient(135deg, #00D4FF 0%, #0099CC 100%)",
                     "color": "#000",
                     "cursor": "pointer",
+                    "marginTop": "28px"
                 }
             )
         ], width=2),
         dbc.Col([
-            html.Div(id="last-update-all", style={"textAlign": "right", "color": "#00D4FF", "fontSize": "0.9rem", "fontWeight": "600", "marginTop": "8px"})
-        ], width=10),
+            html.Div(id="update-timestamp", style={"textAlign": "right", "color": "#00D4FF", "fontSize": "0.9rem", "fontWeight": "600", "marginTop": "35px"})
+        ], width=5),
     ], className="mb-3"),
     
-    dcc.Interval(id="refresh-all", interval=300_000, n_intervals=0),  # Increased to 5 min
-    dcc.Store(id="refresh-trigger-all", data=0),
+    # Auto-refresh interval (5 minutes = 300000 ms)
+    dcc.Interval(
+        id='auto-refresh-interval',
+        interval=5*60*1000,  # 5 minutes in milliseconds
+        n_intervals=0,
+        disabled=True  # Will be enabled when industry is selected
+    ),
+    
+    dcc.Store(id="symbol-industry-map", data={}),
+    dcc.Store(id="stocks-data-store", data={}),
+    dcc.Store(id="current-days", data=10),
+    dcc.Store(id="sort-column", data=None),
+    dcc.Store(id="sort-direction", data="asc"),
     
     dbc.Row([
         dbc.Col([
-            html.Div(id="loading-status", style={"textAlign": "center", "color": "#00D4FF", "fontSize": "1rem", "marginBottom": "10px"}),
-            html.Div(id="stocks-table-container", style={"overflowX": "auto"})
+            dcc.Loading(
+                id="loading-1",
+                type="circle",
+                color="#00D4FF",
+                children=html.Div(id="table-container", style={"overflowX": "auto", "minHeight": "200px"})
+            )
         ], width=12),
     ])
     
@@ -356,60 +483,210 @@ app.layout = dbc.Container([
 
 
 # -------------------------------------------------------------------
-# 7) CALLBACK → Manual Refresh
+# CALLBACKS
 # -------------------------------------------------------------------
+
+# Callback 1: Load initial symbol-industry mapping (INSTANT NOW!)
 @app.callback(
-    Output("refresh-trigger-all", "data"),
-    Input("refresh-all-btn", "n_clicks"),
-    prevent_initial_call=True
+    [Output("symbol-industry-map", "data"),
+     Output("industry-filter", "options")],
+    Input("industry-filter", "id")
 )
-def manual_refresh_all(n_clicks):
-    """Clear all caches on manual refresh."""
-    if n_clicks:
+def initialize_data(_):
+    """Load symbol-industry mapping from CSV - INSTANT LOAD!"""
+    global SYMBOL_INDUSTRY_MAP
+    
+    print("Loading pre-generated industry data...")
+    SYMBOL_INDUSTRY_MAP = load_symbols_with_industries()
+    
+    if not SYMBOL_INDUSTRY_MAP:
+        print("WARNING: No data loaded! Please run fetch_static_data.py first!")
+        return {}, []
+    
+    industries = set(SYMBOL_INDUSTRY_MAP.values())
+    industries.discard("N/A")
+    
+    # Add "All" option at the beginning
+    options = [{"label": "🌐 All Industries", "value": "ALL"}]
+    options.extend([{"label": ind, "value": ind} for ind in sorted(industries)])
+    
+    print(f"✓ Dropdown ready with {len(options)} options (including 'All')")
+    
+    return SYMBOL_INDUSTRY_MAP, options
+
+
+# Callback 2: Enable/Disable refresh button and auto-refresh
+@app.callback(
+    [Output("refresh-btn", "disabled"),
+     Output("auto-refresh-interval", "disabled")],
+    Input("industry-filter", "value")
+)
+def toggle_refresh_and_interval(selected_industry):
+    """Enable refresh button and auto-refresh only when an industry is selected."""
+    is_disabled = selected_industry is None
+    return is_disabled, is_disabled
+
+
+# Callback 3: Fetch data when industry selected, refreshed manually, or auto-refreshed
+@app.callback(
+    [Output("stocks-data-store", "data"),
+     Output("update-timestamp", "children"),
+     Output("current-days", "data")],
+    [Input("industry-filter", "value"),
+     Input("refresh-btn", "n_clicks"),
+     Input("auto-refresh-interval", "n_intervals"),
+     Input("days-input", "value")],
+    State("symbol-industry-map", "data"),
+    running=[
+        (Output("refresh-btn", "disabled"), True, False),
+    ]
+)
+def fetch_industry_data(selected_industry, manual_clicks, auto_intervals, days_input, symbol_industry_map):
+    """Fetch stock data for the selected industry or all industries."""
+    
+    if not selected_industry or not symbol_industry_map:
+        return {}, "", 10
+    
+    # Use default 10 days if invalid input
+    days_comparison = days_input if days_input and days_input > 0 else 10
+    
+    # Determine if this was triggered by manual refresh or auto-refresh
+    ctx = dash.callback_context
+    trigger_source = "Initial Load"
+    
+    if ctx.triggered:
+        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        if trigger_id == "refresh-btn":
+            trigger_source = "Manual Refresh"
+        elif trigger_id == "auto-refresh-interval":
+            trigger_source = "Auto Refresh"
+        elif trigger_id == "days-input":
+            trigger_source = "Days Changed"
+    
+    # Clear caches on manual refresh or auto refresh
+    if manual_clicks or auto_intervals > 0 or trigger_source == "Days Changed":
         get_nse_data.cache_clear()
         get_fundamentals.cache_clear()
         get_volume_stats.cache_clear()
-        print(f"[MANUAL REFRESH] All caches cleared at {datetime.now().strftime('%H:%M:%S')}")
-    return n_clicks
-
-
-# -------------------------------------------------------------------
-# 8) CALLBACK → Update Timestamp
-# -------------------------------------------------------------------
-@app.callback(
-    Output("last-update-all", "children"),
-    Input("refresh-all", "n_intervals"),
-    Input("refresh-trigger-all", "data")
-)
-def update_timestamp_all(intervals, manual_refresh):
-    """Display last update timestamp."""
+        get_historical_comparison.cache_clear()
+        print(f"[{trigger_source.upper()}] Caches cleared at {datetime.now().strftime('%H:%M:%S')}")
+    
+    # Get symbols for selected industry or all symbols
+    if selected_industry == "ALL":
+        symbols_in_industry = list(symbol_industry_map.keys())
+        display_name = "All Industries"
+    else:
+        symbols_in_industry = [symbol for symbol, industry in symbol_industry_map.items() 
+                              if industry == selected_industry]
+        display_name = selected_industry
+    
+    if not symbols_in_industry:
+        return {}, f"No stocks found for {display_name}", days_comparison
+    
+    print(f"\n[FETCHING DATA - {trigger_source}] Loading {len(symbols_in_industry)} stocks for: {display_name} (comparing {days_comparison} days)")
+    
+    # Fetch data with historical comparison
+    stocks_data = fetch_stocks_data_for_industry(symbols_in_industry, days_comparison=days_comparison)
+    
+    # Create timestamp with source indicator
     now = datetime.now().strftime("%H:%M:%S")
-    return f"Last updated: {now}"
+    timestamp = f"Last updated: {now} | {len(stocks_data)} stocks | {days_comparison}D comparison | Next refresh: 5 min"
+    
+    return {selected_industry: stocks_data}, timestamp, days_comparison
 
 
-# -------------------------------------------------------------------
-# 9) CALLBACK → Generate Table
-# -------------------------------------------------------------------
+# Callback 4: Handle column sorting
 @app.callback(
-    [Output("stocks-table-container", "children"),
-     Output("loading-status", "children")],
-    Input("refresh-all", "n_intervals"),
-    Input("refresh-trigger-all", "data")
+    [Output("sort-column", "data"),
+     Output("sort-direction", "data")],
+    Input({"type": "sort-button", "column": ALL}, "n_clicks"),
+    [State("sort-column", "data"),
+     State("sort-direction", "data")],
+    prevent_initial_call=True
 )
-def generate_table(intervals, manual_refresh):
-    """Generate table with all stocks data (HTML table like the old UI)."""
+def handle_sort(n_clicks_list, current_column, current_direction):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return current_column, current_direction
 
-    loading_msg = html.Div([
-        html.Span("⏳ Loading data... This may take 3-5 minutes on free tier", style={"color": "#ffa500", "fontWeight": "600"})
-    ])
+    # Extract which button triggered
+    triggered = ctx.triggered[0]["prop_id"].split(".")[0]
+    triggered_id = eval(triggered)   # Convert string dict to actual dict
 
-    stocks_data = fetch_all_stocks_data(SYMBOLS)
+    column = triggered_id["column"]
+
+    # Toggle direction
+    if column == current_column:
+        new_direction = "desc" if current_direction == "asc" else "asc"
+    else:
+        new_direction = "desc"  # default
+
+    return column, new_direction
+
+# Callback 5: Generate table with sorting
+@app.callback(
+    Output("table-container", "children"),
+    [Input("stocks-data-store", "data"),
+     Input("industry-filter", "value"),
+     Input("current-days", "data"),
+     Input("sort-column", "data"),
+     Input("sort-direction", "data")]
+)
+def generate_table(stocks_data_store, selected_industry, days, sort_column, sort_direction):
+    """Generate table with stock data and sorting."""
+
+    if not selected_industry:
+        return html.Div([
+            html.P("👆 Please select an industry from the dropdown to view stock data", 
+                   style={"color": "#00D4FF", "fontSize": "1.2rem", "textAlign": "center", "marginTop": "50px"})
+        ])
+
+    stocks_data = stocks_data_store.get(selected_industry, [])
 
     if not stocks_data:
-        return html.P("No data available", style={"color": "#ff0000"}), ""
+        return html.Div([
+            html.P("No data loaded yet. Please wait...", 
+                   style={"color": "#888", "fontSize": "1rem", "textAlign": "center", "marginTop": "50px"})
+        ])
 
+    # Use days from store (defaults to 10 if not set)
+    days = days if days and days > 0 else 10
+    
+    # Sort data if sort column is specified
+    if sort_column and stocks_data:
+        # Map column names to data keys
+        column_mapping = {
+            "SYMBOL": "SYMBOL",
+            "INDUSTRIES": "INDUSTRIES",
+            "LAST_CLOSE": "LAST_DAY_CLOSING_PRICE",
+            "OPEN": "TODAY_PRICE_OPEN",
+            "CURRENT": "TODAY_CURRENT_PRICE",
+            "1D_CHANGE": "TODAY_CURRENT_PRICE_CHANGE",
+            "1D_CHANGE_PCT": "TODAY_CURRENT_PRICE_CHANGE_PCT",
+            "ND_PRICE": "HISTORICAL_PRICE",
+            "ND_CHANGE": "HISTORICAL_CHANGE",
+            "ND_CHANGE_PCT": "HISTORICAL_CHANGE_PCT",
+            "52W_HIGH": "52WEEK_HIGH",
+            "52W_LOW": "52WEEK_LOW",
+            "MARKET_CAP": "MARKET_CAP_CR",
+            "PE": "PE",
+            "EPS": "EPS",
+            "AVG_VOLUME": "TODAY_VOLUME_AVERAGE",
+            "TODAY_VOLUME": "TODAY_VOLUME",
+            "VOL_CHANGE_PCT": "VOL_CHANGE_PCT",
+        }
+        
+        data_key = column_mapping.get(sort_column)
+        if data_key:
+            # Sort with None values at the end
+            reverse = (sort_direction == "desc")
+            stocks_data = sorted(
+                stocks_data,
+                key=lambda x: (x.get(data_key) is None, x.get(data_key) if x.get(data_key) is not None else 0),
+                reverse=reverse
+            )
+    
     def format_value(val, decimals=2):
-        """Format numeric values."""
         if val is None:
             return "-"
         try:
@@ -419,7 +696,6 @@ def generate_table(intervals, manual_refresh):
             return str(val)
 
     def format_pct(val):
-        """Format percentage with color."""
         if val is None:
             return "-"
         try:
@@ -431,7 +707,6 @@ def generate_table(intervals, manual_refresh):
             return str(val)
 
     def format_currency(val, decimals=2):
-        """Format currency."""
         if val is None:
             return "-"
         try:
@@ -441,7 +716,6 @@ def generate_table(intervals, manual_refresh):
             return str(val)
 
     def format_marketcap(val):
-        """Format market cap in Crores."""
         if val is None:
             return "-"
         try:
@@ -451,25 +725,55 @@ def generate_table(intervals, manual_refresh):
         except:
             return str(val)
 
-    # Build table rows
+    # Build table
     rows = []
+    
+    # Helper function to create sortable header
+    def create_header(label, column_key, align="center"):
+        is_sorted = (sort_column == column_key)
+        sort_indicator = " ▼" if sort_direction == "desc" else " ▲" if is_sorted else ""
 
-    # Header row
+        return html.Th(
+            html.Button(
+                label + sort_indicator,
+                id={"type": "sort-button", "column": column_key},
+                n_clicks=0,
+                style={
+                    "backgroundColor": "#00D4FF",
+                    "color": "#000",
+                    "fontWeight": "700",
+                    "padding": "10px",
+                    "textAlign": align,
+                    "border": "none",
+                    "cursor": "pointer",
+                    "width": "100%",
+                    "fontSize": "0.9rem"
+                }
+            ),
+            style={"backgroundColor": "#00D4FF", "padding": "0"}
+        )
+
+
+    # Header
     header_row = html.Tr([
-        html.Th("SYMBOL", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "center"}),
-        html.Th("INDUSTRIES", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px"}),
-        html.Th("LAST CLOSE", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("OPEN", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("CURRENT", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("CHANGE", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("CHANGE %", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("AVG VOLUME", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("TODAY VOLUME", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("VOL CHANGE %", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("MARKET CAP (Cr)", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("P/E", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("52W HIGH", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
-        html.Th("52W LOW", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "right"}),
+        create_header("SYMBOL", "SYMBOL", "center"),
+        create_header("INDUSTRIES", "INDUSTRIES", "left"),
+        create_header("LAST CLOSE", "LAST_CLOSE", "right"),
+        create_header("OPEN", "OPEN", "right"),
+        create_header("CURRENT", "CURRENT", "right"),
+        create_header("1D CHANGE", "1D_CHANGE", "right"),
+        create_header("1D CHANGE %", "1D_CHANGE_PCT", "right"),
+        create_header(f"{days}D PRICE", "ND_PRICE", "right"),
+        create_header(f"{days}D CHANGE", "ND_CHANGE", "right"),
+        create_header(f"{days}D CHANGE %", "ND_CHANGE_PCT", "right"),
+        create_header("52W HIGH", "52W_HIGH", "right"),
+        create_header("52W LOW", "52W_LOW", "right"),
+        create_header("MARKET CAP (Cr)", "MARKET_CAP", "right"),
+        create_header("P/E", "PE", "right"),
+        create_header("EPS", "EPS", "right"),
+        create_header("AVG VOLUME", "AVG_VOLUME", "right"),
+        create_header("TODAY VOLUME", "TODAY_VOLUME", "right"),
+        create_header("VOL CHANGE %", "VOL_CHANGE_PCT", "right"),
     ])
     rows.append(header_row)
 
@@ -485,17 +789,20 @@ def generate_table(intervals, manual_refresh):
             html.Td(format_currency(stock["TODAY_CURRENT_PRICE"]), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right", "fontWeight": "700"}),
             html.Td(format_currency(stock["TODAY_CURRENT_PRICE_CHANGE"]), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
             html.Td(format_pct(stock["TODAY_CURRENT_PRICE_CHANGE_PCT"]), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
+            html.Td(format_currency(stock.get("HISTORICAL_PRICE")), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right", "fontSize": "0.9rem"}),
+            html.Td(format_currency(stock.get("HISTORICAL_CHANGE")), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right", "fontSize": "0.9rem"}),
+            html.Td(format_pct(stock.get("HISTORICAL_CHANGE_PCT")), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
+            html.Td(format_currency(stock["52WEEK_HIGH"]), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
+            html.Td(format_currency(stock["52WEEK_LOW"]), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
+            html.Td(format_marketcap(stock["MARKET_CAP_CR"]), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
+            html.Td(format_value(stock["PE"], decimals=2), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
+            html.Td(format_value(stock.get("EPS"), decimals=2), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
             html.Td(format_value(stock["TODAY_VOLUME_AVERAGE"], decimals=0), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right", "fontSize": "0.85rem"}),
             html.Td(format_value(stock.get("TODAY_VOLUME"), decimals=0), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right", "fontSize": "0.85rem"}),
             html.Td(format_pct(stock.get("VOL_CHANGE_PCT")), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
-            html.Td(format_marketcap(stock["MARKET_CAP_CR"]), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
-            html.Td(format_value(stock["PE"], decimals=2), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
-            html.Td(format_currency(stock["52WEEK_HIGH"]), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
-            html.Td(format_currency(stock["52WEEK_LOW"]), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
         ])
         rows.append(row)
     
-    # Build table
     table = dbc.Table(
         html.Tbody(rows),
         bordered=False,
@@ -505,20 +812,16 @@ def generate_table(intervals, manual_refresh):
         style={"fontSize": "0.9rem", "marginTop": "20px"}
     )
     
-    success_msg = html.Div([
-        html.Span(f"✅ Loaded {len(stocks_data)} stocks successfully", style={"color": "#00cc66", "fontWeight": "600"})
-    ])
+    count_indicator = html.Div(
+        f"Showing {len(stocks_data)} stocks" + (f" in {selected_industry}" if selected_industry != "ALL" else " across all industries"),
+        style={"color": "#00D4FF", "fontSize": "0.95rem", "fontWeight": "600", "marginBottom": "10px"}
+    )
     
-    return table, success_msg
+    return html.Div([count_indicator, table])
 
 
 # -------------------------------------------------------------------
-# 10) RUN APP
+# RUN APP
 # -------------------------------------------------------------------
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 8051))
-    run_func = getattr(app, "run", None) or getattr(app, "run_server", None)
-    if run_func is None:
-        raise RuntimeError("No compatible Dash run API found on the 'app' object")
-    run_func(debug=False, host="0.0.0.0", port=port)
+    app.run(debug=False, port=8051)
