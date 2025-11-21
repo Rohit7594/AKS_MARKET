@@ -3,11 +3,17 @@ from dash import html, dcc, Input, Output, State
 import dash_bootstrap_components as dbc
 import pandas as pd
 import yfinance as yf
-from functools import lru_cache
+# from functools import lru_cache # Replaced by diskcache
 from datetime import datetime
 from nsepython import nse_eq
 import time
 from dash.dependencies import ALL
+import diskcache
+import json
+import os
+
+# Initialize persistent cache
+cache = diskcache.Cache("./cache_dir")
 
 # -------------------------------------------------------------------
 # SAFETY WRAPPER
@@ -38,23 +44,27 @@ def retry_with_backoff(func, symbol: str, max_retries: int = 3, base_delay: floa
         try:
             return func(symbol)
         except Exception as e:
-            if "rate" in str(e).lower() or "429" in str(e):
+            err_str = str(e).lower()
+            # Handle JSON decode error (often means blocking/rate limit) or explicit rate limit
+            if "expecting value" in err_str or "rate" in err_str or "429" in err_str:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
-                    print(f"  Rate limited on {symbol}, retrying in {delay:.1f}s...")
+                    print(f"  [Retry {attempt+1}/{max_retries}] Issue with {symbol} ({e}), waiting {delay:.1f}s...")
                     time.sleep(delay)
                 else:
                     print(f"  Max retries exceeded for {symbol}: {e}")
                     return None
             else:
-                raise
+                # For other errors, just print and return None to avoid crashing
+                print(f"  Error fetching {symbol}: {e}")
+                return None
     return None
 
 
 # -------------------------------------------------------------------
 # 1) Load pre-generated symbol-industry mapping (FAST!)
 # -------------------------------------------------------------------
-@lru_cache(maxsize=1)
+@cache.memoize(expire=86400)  # Cache for 24 hours
 def load_symbols_with_industries():
     """Load symbols and industries from pre-generated CSV - INSTANT LOAD!"""
     try:
@@ -88,20 +98,19 @@ SYMBOL_INDUSTRY_MAP = {}
 # -------------------------------------------------------------------
 # 2) CONSOLIDATED NSE DATA FETCH
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
+@cache.memoize(expire=1800)  # Cache for 30 minutes
 def get_nse_data(symbol: str):
     """Fetch full NSE data once and cache."""
-    try:
-        return nse_eq(symbol)
-    except Exception as e:
-        print(f"NSE Data Fetch Error for {symbol}: {e}")
-        return None
+    def _fetch(s):
+        return nse_eq(s)
+    
+    return retry_with_backoff(_fetch, symbol, max_retries=3, base_delay=2.0)
 
 
 # -------------------------------------------------------------------
 # 3) FUNDAMENTALS for single stock
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
+@cache.memoize(expire=1800)  # Cache for 30 minutes
 def get_fundamentals(symbol: str):
     try:
         data = get_nse_data(symbol)
@@ -154,7 +163,7 @@ def get_fundamentals(symbol: str):
 # -------------------------------------------------------------------
 # 4) HISTORICAL PRICE COMPARISON
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
+@cache.memoize(expire=3600)  # Cache for 1 hour
 def get_historical_comparison(symbol: str, days: int):
     """Get price comparison for N days ago."""
     try:
@@ -190,7 +199,7 @@ def get_historical_comparison(symbol: str, days: int):
 # -------------------------------------------------------------------
 # 5) VOLUME STATS
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
+@cache.memoize(expire=1800)  # Cache for 30 minutes
 def get_volume_stats(symbol: str):
     """Return volume metrics with retry backoff for rate limits."""
     
@@ -244,7 +253,7 @@ def get_volume_stats(symbol: str):
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-def fetch_stocks_data_for_industry(symbols, days_comparison=10, batch_size: int = 50, workers: int = 5):
+def fetch_stocks_data_for_industry(symbols, days_comparison=10, batch_size: int = 10, workers: int = 2):
     """Fetch data for multiple stocks in parallel."""
     all_data = []
 
@@ -565,11 +574,9 @@ def fetch_industry_data(selected_industry, manual_clicks, auto_intervals, days_i
     
     # Clear caches on manual refresh or auto refresh
     if manual_clicks or auto_intervals > 0 or trigger_source == "Days Changed":
-        get_nse_data.cache_clear()
-        get_fundamentals.cache_clear()
-        get_volume_stats.cache_clear()
-        get_historical_comparison.cache_clear()
-        print(f"[{trigger_source.upper()}] Caches cleared at {datetime.now().strftime('%H:%M:%S')}")
+        # Only clear relevant keys if possible, but for now clear all is safer for consistency
+        # cache.clear() # Don't clear everything, just let it expire or overwrite
+        print(f"[{trigger_source.upper()}] Refreshing data (using cache if valid)...")
     
     # Get symbols for selected industry or all symbols
     if selected_industry == "ALL":
@@ -798,30 +805,16 @@ def generate_table(stocks_data_store, selected_industry, days, sort_column, sort
             html.Td(format_value(stock["PE"], decimals=2), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
             html.Td(format_value(stock.get("EPS"), decimals=2), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
             html.Td(format_value(stock["TODAY_VOLUME_AVERAGE"], decimals=0), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right", "fontSize": "0.85rem"}),
-            html.Td(format_value(stock.get("TODAY_VOLUME"), decimals=0), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right", "fontSize": "0.85rem"}),
-            html.Td(format_pct(stock.get("VOL_CHANGE_PCT")), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
+            html.Td(format_value(stock["TODAY_VOLUME"], decimals=0), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right", "fontSize": "0.85rem"}),
+            html.Td(format_pct(stock["VOL_CHANGE_PCT"]), style={"backgroundColor": row_bg, "padding": "8px", "textAlign": "right"}),
         ])
         rows.append(row)
-    
-    table = dbc.Table(
-        html.Tbody(rows),
-        bordered=False,
-        className="table-dark",
-        hover=True,
-        responsive=True,
-        style={"fontSize": "0.9rem", "marginTop": "20px"}
+
+    return html.Table(
+        [html.Thead(rows[0]), html.Tbody(rows[1:])],
+        style={"width": "100%", "borderCollapse": "collapse", "minWidth": "1200px"}
     )
-    
-    count_indicator = html.Div(
-        f"Showing {len(stocks_data)} stocks" + (f" in {selected_industry}" if selected_industry != "ALL" else " across all industries"),
-        style={"color": "#00D4FF", "fontSize": "0.95rem", "fontWeight": "600", "marginBottom": "10px"}
-    )
-    
-    return html.Div([count_indicator, table])
 
 
-# -------------------------------------------------------------------
-# RUN APP
-# -------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(debug=False, port=8051)
